@@ -6,7 +6,7 @@
 import { DocumentId } from '../../../platform/inlineEdits/common/dataTypes/documentId';
 import { RootedEdit } from '../../../platform/inlineEdits/common/dataTypes/edit';
 import { LanguageContextResponse } from '../../../platform/inlineEdits/common/dataTypes/languageContext';
-import { DiffHistoryOptions, PromptingStrategy, PromptOptions } from '../../../platform/inlineEdits/common/dataTypes/xtabPromptOptions';
+import { CurrentFileOptions, DiffHistoryOptions, PromptingStrategy, PromptOptions } from '../../../platform/inlineEdits/common/dataTypes/xtabPromptOptions';
 import { StatelessNextEditRequest } from '../../../platform/inlineEdits/common/statelessNextEditProvider';
 import { IXtabHistoryEditEntry, IXtabHistoryEntry } from '../../../platform/inlineEdits/common/workspaceEditTracker/nesXtabHistoryTracker';
 import { ContextKind } from '../../../platform/languageServer/common/languageContextService';
@@ -97,6 +97,36 @@ Your task is to predict and complete the changes the developer would have made n
 - Apologize with "Sorry, I can't assist with that." for requests that may breach Microsoft content guidelines.
 - Avoid undoing or reverting the developer's last change unless there are obvious typos or errors.`;
 
+export const nes41Miniv3SystemPrompt = `Your role as an AI assistant is to help developers complete their code tasks by assisting in editing specific sections of code marked by the <|code_to_edit|> and <|/code_to_edit|> tags, while adhering to Microsoft's content policies and avoiding the creation of content that violates copyrights.
+
+You have access to the following information to help you make informed suggestions:
+
+- recently_viewed_code_snippets: These are code snippets that the developer has recently looked at, which might provide context or examples relevant to the current task. They are listed from oldest to newest. It's possible these are entirely irrelevant to the developer's change.
+- current_file_content: The content of the file the developer is currently working on, providing the broader context of the code.
+- edit_diff_history: A record of changes made to the code, helping you understand the evolution of the code and the developer's intentions. These changes are listed from oldest to latest. It's possible a lot of old edit diff history is entirely irrelevant to the developer's change.
+- area_around_code_to_edit: The context showing the code surrounding the section to be edited.
+- cursor position marked as <|cursor|>: Indicates where the developer's cursor is currently located, which can be crucial for understanding what part of the code they are focusing on.
+
+Your task is to predict and complete the changes the developer would have made next in the <|code_to_edit|> section. The developer may have stopped in the middle of typing. Your goal is to keep the developer on the path that you think they're following. Some examples include further implementing a class, method, or variable, or improving the quality of the code. Make sure the developer doesn't get distracted and ensure your suggestion is relevant. Consider what changes need to be made next, if any. If you think changes should be made, ask yourself if this is truly what needs to happen. If you are confident about it, then proceed with the changes.
+
+# Steps
+
+1. **Review Context**: Analyze the context from the resources provided, such as recently viewed snippets, edit history, surrounding code, and cursor location.
+2. **Evaluate Current Code**: Determine if the current code within the tags requires any corrections or enhancements.
+3. **Suggest Edits**: If changes are required, ensure they align with the developer's patterns and improve code quality.
+4. **Maintain Consistency**: Ensure indentation and formatting follow the existing code style.
+
+# Output Format
+- Your response should start with the word <EDIT> or <NO_CHANGE>.
+- If your are making an edit, start with <EDIT>, then provide the rewritten code window, then </EDIT>.
+- If no changes are necessary, reply only with <NO_CHANGE>.
+- Ensure that you do not output duplicate code that exists outside of these tags. The output should be the revised code that was between these tags and should not include the <|code_to_edit|> or <|/code_to_edit|> tags.
+
+# Notes
+
+- Apologize with "Sorry, I can't assist with that." for requests that may breach Microsoft content guidelines.
+- Avoid undoing or reverting the developer's last change unless there are obvious typos or errors.`;
+
 export const simplifiedPrompt = 'Predict next code edit based on the context given by the user.';
 
 export const xtab275SystemPrompt = `Predict the next code edit based on user context, following Microsoft content policies and avoiding copyright violations. If a request may breach guidelines, reply: "Sorry, I can't assist with that."`;
@@ -128,8 +158,7 @@ they would have made next. Provide the revised code that was between the \`${COD
 // Your revised code goes here
 \`\`\``);
 
-	return `
-\`\`\`
+	return `${opts.promptingStrategy === PromptingStrategy.Nes41Miniv3 ? '' : '```'}
 ${RECENTLY_VIEWED_CODE_SNIPPETS_START}
 ${recentlyViewedCodeSnippets}
 ${RECENTLY_VIEWED_CODE_SNIPPETS_END}
@@ -143,8 +172,7 @@ ${EDIT_DIFF_HISTORY_START_TAG}
 ${editDiffHistory}
 ${EDIT_DIFF_HISTORY_END_TAG}
 
-${areaAroundCodeToEdit}
-\`\`\`
+${areaAroundCodeToEdit}${opts.promptingStrategy === PromptingStrategy.Nes41Miniv3 ? '' : '\n```'}
 
 ${postScript}
 `.trim();
@@ -402,7 +430,8 @@ export function buildCodeSnippetsUsingPagedClipping(
 				new OffsetRange(startPos.lineNumber - 1 /* convert from 1-based to 0-based */, endPos.lineNumber),
 				pageSize,
 				maxTokenBudget,
-				computeTokens
+				computeTokens,
+				false,
 			);
 
 			if (budgetLeft === maxTokenBudget) {
@@ -471,14 +500,6 @@ export const N_LINES_ABOVE = 2;
 export const N_LINES_BELOW = 5;
 
 export const N_LINES_AS_CONTEXT = 15;
-/**
- * Maximum number of lines to include if truncating.
- */
-export const MAX_LINES_IF_TRUNCATING = 1000;
-/**
- * Maximum number of tokens to include if truncating.
- */
-export const MAX_TOKENS_IF_TRUNCATING = 2000;
 
 function expandRangeToPageRange(
 	currentDocLines: string[],
@@ -486,6 +507,7 @@ function expandRangeToPageRange(
 	pageSize: number,
 	maxTokens: number,
 	computeTokens: (s: string) => number,
+	prioritizeAboveCursor: boolean,
 ): { firstPageIdx: number; lastPageIdx: number; budgetLeft: number } {
 
 	const totalNOfPages = Math.ceil(currentDocLines.length / pageSize);
@@ -504,30 +526,57 @@ function expandRangeToPageRange(
 		return { firstPageIdx, lastPageIdx, budgetLeft: availableTokenBudget };
 	}
 
-	const halfOfAvailableTokenBudget = Math.floor(availableTokenBudget / 2);
+	let tokenBudget = availableTokenBudget;
 
-	let tokenBudget = halfOfAvailableTokenBudget; // split by 2 to give both above and below areaAroundCode same budget
+	// TODO: this's specifically implemented with some code duplication to not accidentally change existing behavior
+	if (!prioritizeAboveCursor) { // both above and below get the half of budget
+		const halfOfAvailableTokenBudget = Math.floor(availableTokenBudget / 2);
 
-	for (let i = firstPageIdx - 1; i >= 0 && tokenBudget > 0; --i) {
-		const tokenCountForPage = computeTokensForPage(i);
-		const newTokenBudget = tokenBudget - tokenCountForPage;
-		if (newTokenBudget < 0) {
-			break;
+		tokenBudget = halfOfAvailableTokenBudget; // split by 2 to give both above and below areaAroundCode same budget
+
+		for (let i = firstPageIdx - 1; i >= 0 && tokenBudget > 0; --i) {
+			const tokenCountForPage = computeTokensForPage(i);
+			const newTokenBudget = tokenBudget - tokenCountForPage;
+			if (newTokenBudget < 0) {
+				break;
+			}
+			firstPageIdx = i;
+			tokenBudget = newTokenBudget;
 		}
-		firstPageIdx = i;
-		tokenBudget = newTokenBudget;
-	}
 
-	tokenBudget = halfOfAvailableTokenBudget;
+		tokenBudget = halfOfAvailableTokenBudget;
 
-	for (let i = lastPageIdx + 1; i <= totalNOfPages && tokenBudget > 0; ++i) {
-		const tokenCountForPage = computeTokensForPage(i);
-		const newTokenBudget = tokenBudget - tokenCountForPage;
-		if (newTokenBudget < 0) {
-			break;
+		for (let i = lastPageIdx + 1; i <= totalNOfPages && tokenBudget > 0; ++i) {
+			const tokenCountForPage = computeTokensForPage(i);
+			const newTokenBudget = tokenBudget - tokenCountForPage;
+			if (newTokenBudget < 0) {
+				break;
+			}
+			lastPageIdx = i;
+			tokenBudget = newTokenBudget;
 		}
-		lastPageIdx = i;
-		tokenBudget = newTokenBudget;
+	} else { // code above consumes as much as it can and the leftover budget is given to code below
+		tokenBudget = availableTokenBudget;
+
+		for (let i = firstPageIdx - 1; i >= 0 && tokenBudget > 0; --i) {
+			const tokenCountForPage = computeTokensForPage(i);
+			const newTokenBudget = tokenBudget - tokenCountForPage;
+			if (newTokenBudget < 0) {
+				break;
+			}
+			firstPageIdx = i;
+			tokenBudget = newTokenBudget;
+		}
+
+		for (let i = lastPageIdx + 1; i <= totalNOfPages && tokenBudget > 0; ++i) {
+			const tokenCountForPage = computeTokensForPage(i);
+			const newTokenBudget = tokenBudget - tokenCountForPage;
+			if (newTokenBudget < 0) {
+				break;
+			}
+			lastPageIdx = i;
+			tokenBudget = newTokenBudget;
+		}
 	}
 
 	return { firstPageIdx, lastPageIdx, budgetLeft: tokenBudget };
@@ -540,20 +589,21 @@ export function createTaggedCurrentFileContentUsingPagedClipping(
 	currentDocLines: string[],
 	areaAroundCodeToEdit: string,
 	areaAroundEditWindowLinesRange: OffsetRange,
-	maxTokens: number,
 	computeTokens: (s: string) => number,
 	pageSize: number,
-): string {
+	opts: CurrentFileOptions
+): { taggedCurrentFileContent: string; nLines: number } {
 
 	// subtract budget consumed by areaAroundCodeToEdit
-	const availableTokenBudget = maxTokens - countTokensForLines(areaAroundCodeToEdit.split(/\r?\n/), computeTokens);
+	const availableTokenBudget = opts.maxTokens - countTokensForLines(areaAroundCodeToEdit.split(/\r?\n/), computeTokens);
 
 	const { firstPageIdx, lastPageIdx } = expandRangeToPageRange(
 		currentDocLines,
 		areaAroundEditWindowLinesRange,
 		pageSize,
 		availableTokenBudget,
-		computeTokens
+		computeTokens,
+		opts.prioritizeAboveCursor,
 	);
 
 	const linesOffsetStart = firstPageIdx * pageSize;
@@ -565,5 +615,5 @@ export function createTaggedCurrentFileContentUsingPagedClipping(
 		...currentDocLines.slice(areaAroundEditWindowLinesRange.endExclusive, linesOffsetEnd),
 	];
 
-	return taggedCurrentFileContent.join('\n');
+	return { taggedCurrentFileContent: taggedCurrentFileContent.join('\n'), nLines: taggedCurrentFileContent.length };
 }

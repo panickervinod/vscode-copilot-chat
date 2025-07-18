@@ -22,24 +22,42 @@ export type DiffHistoryOptions = {
 
 export type PagedClipping = { pageSize: number };
 
+export type CurrentFileOptions = {
+	readonly maxTokens: number;
+	readonly includeTags: boolean;
+	readonly prioritizeAboveCursor: boolean;
+}
+
 export type PromptOptions = {
 	readonly promptingStrategy: PromptingStrategy | undefined /* default */;
-	readonly includeTagsInCurrentFile: boolean;
+	readonly currentFile: CurrentFileOptions;
 	readonly pagedClipping: PagedClipping;
 	readonly recentlyViewedDocuments: RecentlyViewedDocumentsOptions;
 	readonly languageContext: LanguageContextOptions;
 	readonly diffHistory: DiffHistoryOptions;
 }
 
+/**
+ * Prompt strategies that tweak prompt in a way that's different from current prod prompting strategy.
+ */
 export enum PromptingStrategy {
-	UnifiedModel = 'unifiedModel',
+	/**
+	 * Original Xtab unified model prompting strategy.
+	 */
+	UnifiedModel = 'xtabUnifiedModel',
+	Codexv21NesUnified = 'codexv21nesUnified',
+	Nes41Miniv3 = 'nes41miniv3',
 	SimplifiedSystemPrompt = 'simplifiedSystemPrompt',
 	Xtab275 = 'xtab275',
 }
 
 export const DEFAULT_OPTIONS: PromptOptions = {
 	promptingStrategy: undefined,
-	includeTagsInCurrentFile: true,
+	currentFile: {
+		maxTokens: 2000,
+		includeTags: true,
+		prioritizeAboveCursor: false,
+	},
 	pagedClipping: {
 		pageSize: 10,
 	},
